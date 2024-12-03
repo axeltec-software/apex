@@ -298,6 +298,22 @@ void cuda_rms_norm(
     at::Tensor* gamma,
     double epsilon);
 
+void cuda_rms_norm_optimized(
+    at::Tensor* output,
+    at::Tensor* invvar,
+    at::Tensor* input,
+    at::Tensor* residual,
+    int n1,
+    int n2,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor* gamma,
+    double epsilon);
+
+
 #define CHECK_CUDA(x) TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
@@ -341,6 +357,51 @@ std::vector<at::Tensor> rms_norm_affine(
   return {output, invvar};
 }
 
+std::vector<at::Tensor> rms_norm_affine_optimized(
+    at::Tensor input,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(gamma);
+  int n1,n2;
+  check_args(input,normalized_shape,gamma,n1,n2);
+  at::Tensor output = at::empty_like(input);
+  const auto stats_dtype = (input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16) ? at::ScalarType::Float : input.scalar_type();
+  at::Tensor invvar = at::empty({n1}, input.options().dtype(stats_dtype));
+  cuda_rms_norm_optimized(&output,&invvar,&input, NULL, n1,n2,
+      normalized_shape,&gamma,epsilon);
+  
+  return {output, invvar};
+}
+
+std::vector<at::Tensor> rms_norm_affine_optimized_fused(
+    at::Tensor input,
+    at::Tensor residual,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(gamma);
+  int n1,n2;
+  check_args(input,normalized_shape,gamma,n1,n2);
+  at::Tensor output = at::empty_like(input);
+  const auto stats_dtype = (input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16) ? at::ScalarType::Float : input.scalar_type();
+  at::Tensor invvar = at::empty({n1}, input.options().dtype(stats_dtype));
+  cuda_rms_norm_optimized(&output,&invvar,&input, &residual, n1,n2,
+      normalized_shape,&gamma,epsilon);
+  
+  return {output, invvar};
+}
+
 std::vector<at::Tensor> rms_norm_affine_mixed_dtypes(
     at::Tensor input,
     #ifdef VERSION_GE_1_1
@@ -356,7 +417,7 @@ std::vector<at::Tensor> rms_norm_affine_mixed_dtypes(
   at::Tensor output = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
   at::Tensor invvar = at::empty({n1}, input.options().dtype(input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ? at::ScalarType::Float : input.scalar_type()));
 
-   cuda_rms_norm(&output,&invvar, &input, n1, n2,
+  cuda_rms_norm(&output,&invvar, &input, n1, n2,
       normalized_shape, &gamma,epsilon);
   return {output,invvar};
 }
@@ -375,6 +436,25 @@ void cuda_rms_norm_gradient(
     at::Tensor* gamma,
     double epsilon,
     at::Tensor* grad_input,
+    at::Tensor* grad_gamma);
+
+
+void cuda_rms_norm_gradient_optimized(
+    at::Tensor* dout,
+    at::Tensor* invvar,
+    at::Tensor* input_or_output,
+    at::Tensor* residual,
+    int n1,
+    int n2,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor* gamma,
+    double epsilon,
+    at::Tensor* grad_input,
+    at::Tensor* grad_residual,
     at::Tensor* grad_gamma);
 
 at::Tensor rms_norm_gradient(
@@ -424,6 +504,57 @@ std::vector<at::Tensor> rms_norm_gradient_affine(
   return {grad_input, grad_gamma};
 }
 
+std::vector<at::Tensor> rms_norm_gradient_affine_optimized(
+    at::Tensor dout,
+    at::Tensor invvar,
+    at::Tensor input_or_output,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(dout);
+  CHECK_INPUT(invvar);
+  CHECK_INPUT(input_or_output);
+  CHECK_INPUT(gamma);
+  int n1,n2;
+  check_args(input_or_output,normalized_shape,gamma,n1,n2);
+  at::Tensor grad_input = at::empty_like(input_or_output);
+  at::Tensor grad_gamma = at::empty_like(gamma);
+  cuda_rms_norm_gradient_optimized(&dout,&invvar,&input_or_output, NULL, n1,n2,
+      normalized_shape,&gamma,epsilon,
+      &grad_input, NULL, &grad_gamma);
+  return {grad_input, grad_gamma};
+}
+
+std::vector<at::Tensor> rms_norm_gradient_affine_optimized_fused(
+    at::Tensor dout,
+    at::Tensor invvar,
+    at::Tensor input_or_output,
+    at::Tensor residual,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(dout);
+  CHECK_INPUT(invvar);
+  CHECK_INPUT(input_or_output);
+  CHECK_INPUT(gamma);
+  int n1,n2;
+  check_args(input_or_output,normalized_shape,gamma,n1,n2);
+  at::Tensor grad_input = at::empty_like(input_or_output);
+  at::Tensor grad_residual = at::empty_like(residual);
+  at::Tensor grad_gamma = at::empty_like(gamma);
+  cuda_rms_norm_gradient_optimized(&dout,&invvar,&input_or_output, &residual, n1,n2,
+      normalized_shape,&gamma,epsilon,
+      &grad_input, &grad_residual, &grad_gamma);
+  return {grad_input, grad_residual, grad_gamma};
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_affine", &layer_norm_affine, "LayerNorm forward (CUDA)");
@@ -437,6 +568,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_forward", &rms_norm, "RMSNorm forward (CUDA)");
   m.def("rms_backward_affine", &rms_norm_gradient_affine, "RMSNorm backward (CUDA)");
   m.def("rms_backward", &rms_norm_gradient, "RMSNorm backward (CUDA)");
+
+  m.def("rms_forward_affine_optimized", &rms_norm_affine_optimized, "RMSNorm forward (CUDA) optimized", py::call_guard<py::gil_scoped_release>());
+  m.def("rms_forward_affine_optimized_fused", &rms_norm_affine_optimized_fused, "RMSNorm forward (CUDA) optimized", py::call_guard<py::gil_scoped_release>());
+
+  m.def("rms_backward_affine_optimized", &rms_norm_gradient_affine_optimized, "RMSNorm backward (CUDA) optimized", py::call_guard<py::gil_scoped_release>());
+  m.def("rms_backward_affine_optimized_fused", &rms_norm_gradient_affine_optimized_fused, "RMSNorm backward (CUDA) optimized", py::call_guard<py::gil_scoped_release>());
 
   m.def("rms_forward_affine_mixed_dtypes", &rms_norm_affine_mixed_dtypes, "RMSNorm forward with mixed dtypes (CUDA) compatible with Megatron's implementation");
 }

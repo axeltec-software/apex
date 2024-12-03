@@ -58,27 +58,54 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
 
 class FusedRMSNormAffineFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, normalized_shape, eps):
+    def forward(ctx, input, weight, normalized_shape, eps, residual=None, optimized=False):
         global fused_layer_norm_cuda
         if fused_layer_norm_cuda is None:
             fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
         ctx.normalized_shape = normalized_shape
         ctx.eps = eps
+        ctx.optimized = optimized
+        ctx.add_residual = True if residual is not None else False
         input_ = input.contiguous()
         weight_ = weight.contiguous()
-        output, invvar = fused_layer_norm_cuda.rms_forward_affine(
-            input_, ctx.normalized_shape, weight_, ctx.eps)
-        ctx.save_for_backward(input_, weight_, invvar)
+        residual_ = residual.contiguous() if ctx.add_residual else None
+        if not optimized:
+            output, invvar = fused_layer_norm_cuda.rms_forward_affine(
+                input_, ctx.normalized_shape, weight_, ctx.eps)
+        else:
+            if ctx.add_residual:
+                output, invvar = fused_layer_norm_cuda.rms_forward_affine_optimized_fused(
+                    input_, residual_, ctx.normalized_shape, weight_, ctx.eps)
+            else:
+                
+                output, invvar = fused_layer_norm_cuda.rms_forward_affine_optimized(
+                    input_, ctx.normalized_shape, weight_, ctx.eps)
+
+       
+        ctx.save_for_backward(input_, residual, weight_, invvar)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, weight_, invvar = ctx.saved_tensors
-        grad_input = grad_weight = None
-        grad_input, grad_weight = fused_layer_norm_cuda.rms_backward_affine(
-           grad_output.contiguous(), invvar, input_, ctx.normalized_shape, weight_, ctx.eps
-        )
-        return grad_input, grad_weight, None, None
+        input_or_output, residual, weight_, invvar = ctx.saved_tensors
+        grad_input = grad_weight = grad_residual = None
+        if ctx.optimized:
+            if ctx.add_residual:
+                grad_input, grad_residual, grad_weight = fused_layer_norm_cuda.rms_backward_affine_optimized_fused(
+                        grad_output.contiguous(), invvar, input_or_output, residual,
+                        ctx.normalized_shape, weight_, ctx.eps
+                    )
+            else:
+                grad_input, grad_weight = fused_layer_norm_cuda.rms_backward_affine_optimized(
+                        grad_output.contiguous(), invvar, input_or_output,
+                        ctx.normalized_shape, weight_, ctx.eps
+                    )
+        else:
+            grad_input, grad_weight = fused_layer_norm_cuda.rms_backward_affine(
+                    grad_output.contiguous(), invvar, input_or_output,
+                    ctx.normalized_shape, weight_, ctx.eps
+                )
+        return grad_input, grad_weight, None, None, grad_residual, None, None
 
 
 class FusedLayerNormAffineMixedDtypesFunction(FusedLayerNormAffineFunction):
