@@ -81,8 +81,8 @@ class FusedRMSNormAffineFunction(torch.autograd.Function):
                 output, invvar = fused_layer_norm_cuda.rms_forward_affine_optimized(
                     input_, ctx.normalized_shape, weight_, ctx.eps)
 
-       
-        ctx.save_for_backward(input_, residual, weight_, invvar)
+        if input.requires_grad:
+            ctx.save_for_backward(input_, residual, weight_, invvar)
         return output
 
     @staticmethod

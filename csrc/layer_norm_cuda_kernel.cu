@@ -8,6 +8,7 @@
 
 #include "type_shim.h"
 
+#include <iostream>
 
 template<typename U> __device__
 void cuWelfordOnlineSum(
@@ -186,7 +187,8 @@ void cuWelfordMuSigma2Optimized(
   U& mu,
   U& sigma2,
   U* buf,
-  const int GPU_WARP_SIZE)
+  const int GPU_WARP_SIZE,
+  const int BLOCK_DIM)
 {
   // Assumptions:
   // 1) blockDim.x == warpSize
@@ -211,6 +213,7 @@ void cuWelfordMuSigma2Optimized(
         cuRMSOnlineSum<U>(curr, sigma2);
       }
     }
+    #pragma unroll
     for (;  l < n2;  ++l) {
       U curr = static_cast<U>(lvals[l]);
       cuRMSOnlineSum<U>(curr, sigma2);
@@ -223,10 +226,11 @@ void cuWelfordMuSigma2Optimized(
     }
     // threadIdx.x == 0 has correct values for each warp
     // inter-warp reductions
-    if (blockDim.y > 1) {
+    if (BLOCK_DIM > 1) {
       U* ubuf = (U*)buf;
-      U* ibuf = (U*)(ubuf + blockDim.y);
-      for (int offset = blockDim.y/2;  offset > 0;  offset /= 2) {
+      // U* ibuf = (U*)(ubuf + BLOCK_DIM);
+      #pragma unroll
+      for (int offset = BLOCK_DIM/2;  offset > 0;  offset /= 2) {
         // upper half of warps write to shared
         if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2*offset) {
           const int wrt_y = threadIdx.y - offset;
@@ -467,7 +471,8 @@ void cuWelfordMuSigma2Optimized(
   float& mu,
   float& sigma2,
   float* buf,
-  const int GPU_WARP_SIZE)
+  const int GPU_WARP_SIZE,
+  const int BLOCK_DIM)
 {
   // Assumptions:
   // 1) blockDim.x == warpSize
@@ -518,7 +523,8 @@ void cuWelfordMuSigma2Optimized(
     // inter-warp reductions
     if (blockDim.y > 1) {
       float* ubuf = (float*)buf;
-      for (int offset = blockDim.y/2;  offset > 0;  offset /= 2) {
+      #pragma unroll
+      for (int offset = BLOCK_DIM/2;  offset > 0;  offset /= 2) {
         // upper half of warps write to shared
         if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2*offset) {
           const int wrt_y = threadIdx.y - offset;
@@ -758,22 +764,23 @@ void cuApplyRMSNormOptimized_(
   const int n2,
   const U epsilon,
   const V* __restrict__ gamma,
-  const int GPU_WARP_SIZE)
+  const int GPU_WARP_SIZE,
+  const int BLOCK_DIM)
 {
   // Assumptions:
   // 1) blockDim.x == warpSize
   // 2) Tensors are contiguous
   //
+  const int numx = blockDim.x * blockDim.y;
   for (auto i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
     SharedMemory<U> shared;
     U* buf = shared.getPointer();
     U mu,sigma2;
-    cuWelfordMuSigma2Optimized(vals,n1,n2,i1,mu,sigma2,buf, GPU_WARP_SIZE);
+    cuWelfordMuSigma2Optimized(vals,n1,n2,i1,mu,sigma2,buf, GPU_WARP_SIZE, BLOCK_DIM);
 
     const T* lvals = vals + i1*n2;
     V* ovals = output_vals + i1*n2;
     U c_invvar = rsqrt(sigma2 + epsilon);
-    const int numx = blockDim.x * blockDim.y;
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
@@ -863,20 +870,34 @@ void cuApplyRMSNormOptimized(
   V* __restrict__ output_vals,
   U* __restrict__ invvar,
   const T* __restrict__ vals,
+  const int n1,
+  const int n2,
+  const U epsilon,
+  const V* __restrict__ gamma,
+  const int warp_size,
+  const int block_dim)
+{
+  
+  cuApplyRMSNormOptimized_<T, U, V>(output_vals, invvar, vals, n1, n2, epsilon, gamma, warp_size, block_dim);
+}
+
+template<typename T, typename U, typename V=T> __global__
+void cuApplyRMSNormOptimizedFused(
+  V* __restrict__ output_vals,
+  U* __restrict__ invvar,
+  const T* __restrict__ vals,
   const T* __restrict__ residual,
   const int n1,
   const int n2,
   const U epsilon,
   const V* __restrict__ gamma,
-  const int warp_size)
+  const int warp_size,
+  const int block_dim)
 {
-  if (residual != NULL) {
-    cuApplyRMSNormOptimizedFused_<T, U, V>(output_vals, invvar, vals, residual, n1, n2, epsilon, gamma, warp_size);
-  }
-  else {
-    cuApplyRMSNormOptimized_<T, U, V>(output_vals, invvar, vals, n1, n2, epsilon, gamma, warp_size);
-  }
+  cuApplyRMSNormOptimizedFused_<T, U, V>(output_vals, invvar, vals, residual, n1, n2, epsilon, gamma, warp_size);
 }
+
+
 
 template<typename T, typename U, typename V> __device__
 void cuLoadWriteStridedInputs(
@@ -1862,18 +1883,28 @@ void HostApplyRMSNormOptimized(
     const int warp_size = at::cuda::warp_size();
     const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
-    dim3 threads(warp_size,4,1);
-    #ifdef USE_ROCM
-    // Optimization for ROCm MI100
-    threads.y = 2;
-    #endif
+    int block_dim = std::max(1, std::round(n2 / 2048.0));
+    block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
+    // std::cout << " BLOCK DIM: " << block_dim << "N1:  " << n1 << "N2: " << n2 << std::endl;
+    dim3 threads(warp_size, block_dim,1);
+    // #ifdef USE_ROCM
+    // // Optimization for ROCm MI100
+    // threads.y = block_dim;
+    // #endif
     int nshared =
         threads.y > 1 ?
             threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
             0; 
     
-    cuApplyRMSNormOptimized<<<blocks, threads, nshared, stream>>>(
-      output, invvar, input, residual, n1, n2, U(epsilon), gamma, warp_size);
+    if (residual != NULL) {
+      cuApplyRMSNormOptimizedFused<<<blocks, threads, nshared, stream>>>(
+        output, invvar, input, residual, n1, n2, U(epsilon), gamma, warp_size, block_dim);
+    }
+    else {
+      cuApplyRMSNormOptimized<<<blocks, threads, nshared, stream>>>(
+        output, invvar, input, n1, n2, U(epsilon), gamma, warp_size, block_dim);
+    }
+    
 }
 
 void cuda_layer_norm(
