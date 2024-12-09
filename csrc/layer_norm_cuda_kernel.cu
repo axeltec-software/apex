@@ -229,7 +229,6 @@ void cuWelfordMuSigma2Optimized(
     if (BLOCK_DIM > 1) {
       U* ubuf = (U*)buf;
       // U* ibuf = (U*)(ubuf + BLOCK_DIM);
-      #pragma unroll
       for (int offset = BLOCK_DIM/2;  offset > 0;  offset /= 2) {
         // upper half of warps write to shared
         if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2*offset) {
@@ -970,15 +969,17 @@ void cuLoadWriteStridedInputsOptimized(
     const int n2,
     const U* __restrict__ invvar,
     const V* __restrict__ gamma,
-    const double eps
+    const double eps,
+    const int BLOCK_DIM
     )
 {
   int i1 = i1_block+thr_load_row_off;
   if (i1 < i1_end) {
-    for (int k = 0;  k < blockDim.y;  ++k) {
-      int i2 = i2_off + k;
-      int load_idx = i1*n2+i2;
-      int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
+    #pragma unroll
+    for (int k = 0;  k < BLOCK_DIM;  ++k) {
+      const int i2 = i2_off + k;
+      const int load_idx = i1*n2+i2;
+      const int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
       if (i2<n2) {
         U c_h = static_cast<U>(input_or_output[load_idx]);
         U curr_dout = static_cast<U>(dout[load_idx]);
@@ -988,8 +989,9 @@ void cuLoadWriteStridedInputsOptimized(
       }
     }
   } else {
-    for (int k = 0;  k < blockDim.y;  ++k) {
-      int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
+    #pragma unroll
+    for (int k = 0;  k < BLOCK_DIM;  ++k) {
+      const int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
       warp_buf2[write_idx] = U(0);
     }
   }
@@ -1095,12 +1097,13 @@ void cuLoadAddStridedInputsOptimized(
     const int n2,
     const U* __restrict__ invvar,
     const V* __restrict__ gamma,
-    const double eps
+    const double eps,
+    const int BLOCK_DIM
     )
 {
   int i1 = i1_block+thr_load_row_off;
   if (i1 < i1_end) {
-    for (int k = 0;  k < blockDim.y;  ++k) {
+    for (int k = 0;  k < BLOCK_DIM;  ++k) {
       int i2 = i2_off + k;
       int load_idx = i1*n2+i2;
       int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
@@ -1237,7 +1240,8 @@ void cuComputePartGradGammaBetaOptimized(
     U epsilon,
     const V* __restrict__ gamma,
     U* part_grad_gamma,
-    const double eps)
+    const double eps,
+    const int BLOCK_DIM)
 {
     const int numsegs_n1 = (n1+blockDim.y*blockDim.y-1) / (blockDim.y*blockDim.y);
     const int segs_per_block = (numsegs_n1 + gridDim.y - 1) / gridDim.y;
@@ -1254,16 +1258,16 @@ void cuComputePartGradGammaBetaOptimized(
     U* warp_buf2 = warp_buf1 + blockDim.y * blockDim.y * row_stride;
     // compute partial sums from strided inputs
     // do this to increase number of loads in flight
-    cuLoadWriteStridedInputsOptimized<T, U, V>(i1_beg,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output,dout,i1_end,n2, invvar,gamma, eps);
+    cuLoadWriteStridedInputsOptimized<T, U, V>(i1_beg,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output,dout,i1_end,n2, invvar,gamma, eps, BLOCK_DIM);
     for (int i1_block = i1_beg+blockDim.y*blockDim.y;  i1_block < i1_end;  i1_block+=blockDim.y*blockDim.y) {
-      cuLoadAddStridedInputsOptimized<T, U, V>(i1_block,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output,dout,i1_end,n2,invvar,gamma, eps);
+      cuLoadAddStridedInputsOptimized<T, U, V>(i1_block,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output,dout,i1_end,n2,invvar,gamma, eps, BLOCK_DIM);
     }
     __syncthreads();
     // inter-warp reductions
     // sum within each warp
     U acc1 = U(0);
     U acc2 = U(0);
-    for (int k = 0;  k < blockDim.y;  ++k) {
+    for (int k = 0;  k < BLOCK_DIM;  ++k) {
       int row1 = threadIdx.y + k*blockDim.y;
       int idx1 = row1*row_stride + threadIdx.x;
       acc2 += warp_buf2[idx1];
@@ -1271,7 +1275,7 @@ void cuComputePartGradGammaBetaOptimized(
     warp_buf2[threadIdx.y*row_stride+threadIdx.x] = acc2;
     __syncthreads();
     // sum all warps
-    for (int offset = blockDim.y/2;  offset > 1;  offset /= 2) {
+    for (int offset = BLOCK_DIM/2;  offset > 1;  offset /= 2) {
       if (threadIdx.y < offset) {
         int row1 = threadIdx.y;
         int row2 = threadIdx.y + offset;
@@ -1422,7 +1426,8 @@ void cuComputeGradGammaBetaOptimized(
     const int part_size,
     const int n1,
     const int n2,
-    V* grad_gamma)
+    V* grad_gamma,
+    const int BLOCK_DIM)
 {
     // sum partial gradients for gamma and beta
     SharedMemory<U> shared;
@@ -1430,10 +1435,12 @@ void cuComputeGradGammaBetaOptimized(
     int i2 = blockIdx.x * blockDim.x + threadIdx.x;
     if (i2 < n2) {
       // each warp does sequential reductions until reduced part_size is num_warps
-      int num_warp_reductions = part_size / blockDim.y;
+      const int num_warp_reductions = part_size / BLOCK_DIM;
       U sum_gamma = U(0);
       U sum_beta = U(0);
       const U* part_grad_gamma_ptr = part_grad_gamma + threadIdx.y * num_warp_reductions * n2 + i2;
+
+      #pragma unroll
       for (int warp_offset = 0;  warp_offset < num_warp_reductions;  ++warp_offset) {
         sum_gamma += part_grad_gamma_ptr[warp_offset*n2];
       }
@@ -1658,28 +1665,33 @@ void cuComputeGradInputOptimized(
     const U* __restrict__ invvar,
     U epsilon,
     const V* gamma,
-    T* grad_input)
+    T* grad_input,
+    const int BLOCK_DIM,
+    const int warp_size)
 {
+  const int numx = BLOCK_DIM * warp_size;
   for (int i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
     U sum_loss1 = U(0);
     U sum_loss2 = U(0);
     const U c_invvar = invvar[i1];
     const T* k_input = input + i1*n2;
     const V* k_dout = dout + i1*n2;
-    const int numx = blockDim.x * blockDim.y;
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
     
     // Optimization for ROCm MI100
     for( int l = 0; l < n2 ; l += numx) {
       int idx = l + thrx;
-      const U gamma_idx = static_cast<U>((idx<n2) ? gamma[idx] : V(0));
-      const U c_h = static_cast<U>((idx<n2) ? k_input[idx] : T(0));
-      const U c_loss = static_cast<U>((idx<n2) ? k_dout[idx] : V(0));
-      sum_loss2 += c_loss * gamma_idx * (c_h) * c_invvar;
+      if (idx < n2) {
+        const U gamma_idx = static_cast<U>(gamma[idx]);
+        const U c_h = static_cast<U>(k_input[idx]);
+        const U c_loss = static_cast<U>(k_dout[idx]);
+        sum_loss2 += c_loss * gamma_idx * c_h * c_invvar;
+      }
     }
     
     // intra-warp reductions
-    for (int mask = blockDim.x/2;  mask > 0;  mask /= 2) {
+    #pragma unroll
+    for (int mask = warp_size/2;  mask > 0;  mask /= 2) {
       sum_loss2 += WARP_SHFL_XOR(sum_loss2, mask);
     }
     // inter-warp reductions
@@ -1885,12 +1897,7 @@ void HostApplyRMSNormOptimized(
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
     int block_dim = std::max(1, std::round(n2 / 2048.0));
     block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
-    // std::cout << " BLOCK DIM: " << block_dim << "N1:  " << n1 << "N2: " << n2 << std::endl;
     dim3 threads(warp_size, block_dim,1);
-    // #ifdef USE_ROCM
-    // // Optimization for ROCm MI100
-    // threads.y = block_dim;
-    // #endif
     int nshared =
         threads.y > 1 ?
             threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
@@ -2174,7 +2181,8 @@ void HostRMSNormGradientOptimized(
     const int warp_size = at::cuda::warp_size();
     if (gamma != NULL) {
       const int part_size = warp_size;
-      const dim3 threads2(warp_size,4,1);
+      const int BLOCK_DIM = 4;
+      const dim3 threads2(warp_size,BLOCK_DIM,1);
       const dim3 blocks2((n2+threads2.x-1)/threads2.x,part_size,1);
       const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y * (threads2.x + 1);
       const int nshared2_b = threads2.x * threads2.y * sizeof(U);
@@ -2209,23 +2217,26 @@ void HostRMSNormGradientOptimized(
                         U(epsilon),
                         gamma,
                         part_grad_gamma.DATA_PTR<U>(),
-                        epsilon);
+                        epsilon,
+                        BLOCK_DIM);
       }
 
-      const dim3 threads3(warp_size,8,1);
+      const int BLOCK_DIM_GAMMA = 8;
+      const dim3 threads3(warp_size, BLOCK_DIM_GAMMA, 1);
       const dim3 blocks3((n2+threads2.x-1)/threads2.x,1,1);
       const int nshared3 = threads3.x * threads3.y * sizeof(U);
       cuComputeGradGammaBetaOptimized<<<blocks3, threads3, nshared3, stream>>>(
                       part_grad_gamma.DATA_PTR<U>(),
                       part_size,
                       n1,n2,
-                      grad_gamma);
+                      grad_gamma,BLOCK_DIM_GAMMA);
     }
 
     // compute grad_input
     const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
-    const dim3 threads1(warp_size,4,1);
+    const int  BLOCK_DIM_INPUT = std::round(n2 / 512.0);
+    const dim3 threads1(warp_size,BLOCK_DIM_INPUT,1);
     int nshared =
             threads1.y > 1 ?
             threads1.y*threads1.x*sizeof(U) :
@@ -2252,7 +2263,9 @@ void HostRMSNormGradientOptimized(
               invvar,
               U(epsilon),
               gamma,
-              grad_input);
+              grad_input,
+              BLOCK_DIM_INPUT,
+              warp_size);
     }
       
 }

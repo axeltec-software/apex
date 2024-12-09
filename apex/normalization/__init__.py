@@ -1,1 +1,1 @@
-from .fused_layer_norm import FusedLayerNorm, MixedFusedLayerNorm, FusedRMSNorm, MixedFusedRMSNorm, FusedRMSNormAffineFunction
+from .fused_layer_norm import FusedLayerNorm, MixedFusedLayerNorm, FusedRMSNorm, MixedFusedRMSNorm, FusedRMSNormAffineFunction, FusedRMSNormOptimized
