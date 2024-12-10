@@ -81,8 +81,7 @@ class FusedRMSNormAffineFunction(torch.autograd.Function):
                 output, invvar = fused_layer_norm_cuda.rms_forward_affine_optimized(
                     input_, ctx.normalized_shape, weight_, ctx.eps)
 
-        if input.requires_grad:
-            ctx.save_for_backward(input_, residual, weight_, invvar)
+        ctx.save_for_backward(input_, residual, weight_, invvar)
         return output
 
     @staticmethod
@@ -105,7 +104,7 @@ class FusedRMSNormAffineFunction(torch.autograd.Function):
                     grad_output.contiguous(), invvar, input_or_output,
                     ctx.normalized_shape, weight_, ctx.eps
                 )
-        return grad_input, grad_weight, None, None, grad_residual, None, None
+        return grad_input, grad_weight, None, None,  grad_residual, None
 
 
 class FusedLayerNormAffineMixedDtypesFunction(FusedLayerNormAffineFunction):
@@ -130,7 +129,7 @@ class FusedLayerNormAffineMixedDtypesFunction(FusedLayerNormAffineFunction):
 class FusedRMSNormAffineMixedDtypesFunction(FusedRMSNormAffineFunction):
 
     @staticmethod
-    def forward(ctx, input, weight, normalized_shape, eps):
+    def forward(ctx, input, weight, normalized_shape, eps, residual=None, optimized=False):
         global fused_layer_norm_cuda
         if fused_layer_norm_cuda is None:
             fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
@@ -138,11 +137,24 @@ class FusedRMSNormAffineMixedDtypesFunction(FusedRMSNormAffineFunction):
         ctx.eps = eps
         input_ = input.contiguous()
         weight_ = weight.contiguous()
-        output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes(
-            input_, ctx.normalized_shape, weight_, ctx.eps
-        )
+        ctx.optimized = optimized
+        ctx.add_residual = True if residual is not None else False
+        residual_ = residual.contiguous() if ctx.add_residual else None
+        if not optimized:
+            output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes(
+                input_, ctx.normalized_shape, weight_, ctx.eps
+            )
+        else:
+            if ctx.add_residual:
+                output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes_optimized_fused(
+                    input_, residual_, ctx.normalized_shape, weight_, ctx.eps
+                )
+            else:
+                output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes_optimized(
+                    input_, ctx.normalized_shape, weight_, ctx.eps
+                )
 
-        ctx.save_for_backward(input_, weight_, invvar)
+        ctx.save_for_backward(input_, residual, weight_, invvar)
         return output
 
 
@@ -222,8 +234,8 @@ def fused_rms_norm(input, normalized_shape, eps=1e-6):
         return FusedRMSNormFunction.apply(*args)
 
 
-def mixed_dtype_fused_rms_norm_affine(input, weight, normalized_shape, eps=1e-6):
-    args = _cast_if_autocast_enabled(input, weight, normalized_shape, eps)
+def mixed_dtype_fused_rms_norm_affine(input, weight, normalized_shape, eps=1e-6, residual=None, optimized=False):
+    args = _cast_if_autocast_enabled(input, weight, normalized_shape, eps, residual, optimized)
     with torch.cuda.amp.autocast(enabled=False):
         return FusedRMSNormAffineMixedDtypesFunction.apply(*args)
 
@@ -542,7 +554,7 @@ class MixedFusedLayerNorm(FusedLayerNorm):
 # See: `layer_norm_affine` and `layer_norm_affine_mixed_dtypes` in "csrc/layer_norm_cuda.cpp"
 class MixedFusedRMSNorm(FusedRMSNorm):
 
-    def __init__(self, normalized_shape, eps=1e-5, **kwargs):
+    def __init__(self, normalized_shape, eps=1e-5, optimized=False,**kwargs):
         if "elementwise_affine" in kwargs:
             import warnings
             warnings.warn("MixedFusedRMSNorm does not support `elementwise_affine` argument")
@@ -550,11 +562,12 @@ class MixedFusedRMSNorm(FusedRMSNorm):
             if not elementwise_affine:
                 raise RuntimeError("MixedFusedRMSNorm does not support `elementwise_affine = False`")
 
+        self.optimized = optimized
         super().__init__(normalized_shape=normalized_shape, eps=eps, elementwise_affine=True)
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, residual=None):
         # NOTE (mkozuki): CPU path is here mainly for unittest sake.
         # TODO Manual RMS Norm Implementation Here
         if not input.is_cuda:
             return manual_rms_norm(input, self.normalized_shape, self.weight, self.eps)
-        return mixed_dtype_fused_rms_norm_affine(input, self.weight, self.normalized_shape, self.eps)
+        return mixed_dtype_fused_rms_norm_affine(input, self.weight, self.normalized_shape, self.eps, residual, self.optimized)

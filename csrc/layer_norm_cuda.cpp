@@ -422,6 +422,47 @@ std::vector<at::Tensor> rms_norm_affine_mixed_dtypes(
   return {output,invvar};
 }
 
+std::vector<at::Tensor> rms_norm_affine_mixed_dtypes_optimized(
+    at::Tensor input,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(input);
+  int n1, n2;
+  check_args(input, normalized_shape, n1, n2);
+  at::Tensor output = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
+  at::Tensor invvar = at::empty({n1}, input.options().dtype(input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ? at::ScalarType::Float : input.scalar_type()));
+
+  cuda_rms_norm_optimized(&output,&invvar, &input,NULL, n1, n2,
+      normalized_shape, &gamma,epsilon);
+  return {output,invvar};
+}
+
+std::vector<at::Tensor> rms_norm_affine_mixed_dtypes_optimized_fused(
+    at::Tensor input,
+    at::Tensor residual,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor gamma,
+    double epsilon) {
+  CHECK_INPUT(input);
+  int n1, n2;
+  check_args(input, normalized_shape, n1, n2);
+  at::Tensor output = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
+  at::Tensor invvar = at::empty({n1}, input.options().dtype(input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ? at::ScalarType::Float : input.scalar_type()));
+
+  cuda_rms_norm_optimized(&output,&invvar, &input, &residual, n1, n2,
+      normalized_shape, &gamma,epsilon);
+  return {output,invvar};
+}
+
 void cuda_rms_norm_gradient(
     at::Tensor* dout,
     at::Tensor* invvar,
@@ -576,4 +617,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_backward_affine_optimized_fused", &rms_norm_gradient_affine_optimized_fused, "RMSNorm backward (CUDA) optimized", py::call_guard<py::gil_scoped_release>());
 
   m.def("rms_forward_affine_mixed_dtypes", &rms_norm_affine_mixed_dtypes, "RMSNorm forward with mixed dtypes (CUDA) compatible with Megatron's implementation");
+  m.def("rms_forward_affine_mixed_dtypes_optimized", &rms_norm_affine_mixed_dtypes_optimized, "RMSNorm forward with mixed dtypes (CUDA) compatible with Megatron's implementation");
+  m.def("rms_forward_affine_mixed_dtypes_optimized_fused", &rms_norm_affine_mixed_dtypes_optimized_fused, "RMSNorm forward with mixed dtypes (CUDA) compatible with Megatron's implementation");
 }
