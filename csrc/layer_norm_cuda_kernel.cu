@@ -1805,6 +1805,7 @@ void cuComputeGradInputOptimizedFused(
     U fH = (U)n2;
     U term1 = (U(1) / fH) * c_invvar;
     T* k_grad_input = grad_input + i1*n2;
+    T* k_grad_resdiaul = grad_residual + i1*n2;
     for (int l = thrx;  l < n2;  l+=numx) {
       const U c_h = static_cast<U>(k_input[l] + res_input[l]);
       const U c_loss = static_cast<U>(k_dout[l]);
@@ -1812,6 +1813,7 @@ void cuComputeGradInputOptimizedFused(
       f_grad_input -= (c_h) * c_invvar * sum_loss2;
       f_grad_input *= term1;
       k_grad_input[l] = static_cast<T>(f_grad_input);
+      k_grad_resdiaul[l] = static_cast<T>(f_grad_input);
     }
     
     // prevent race where buf is written again before reads are done

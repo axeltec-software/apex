@@ -81,7 +81,7 @@ class FusedRMSNormAffineFunction(torch.autograd.Function):
                 output, invvar = fused_layer_norm_cuda.rms_forward_affine_optimized(
                     input_, ctx.normalized_shape, weight_, ctx.eps)
 
-        ctx.save_for_backward(input_, residual, weight_, invvar)
+        ctx.save_for_backward(input_, residual_, weight_, invvar)
         return output
 
     @staticmethod
@@ -561,7 +561,6 @@ class MixedFusedRMSNorm(FusedRMSNorm):
             elementwise_affine = kwargs.pop("elementwise_affine")
             if not elementwise_affine:
                 raise RuntimeError("MixedFusedRMSNorm does not support `elementwise_affine = False`")
-
         self.optimized = optimized
         super().__init__(normalized_shape=normalized_shape, eps=eps, elementwise_affine=True)
 
