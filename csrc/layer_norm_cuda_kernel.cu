@@ -522,7 +522,6 @@ void cuWelfordMuSigma2Optimized(
     // inter-warp reductions
     if (blockDim.y > 1) {
       float* ubuf = (float*)buf;
-      #pragma unroll
       for (int offset = BLOCK_DIM/2;  offset > 0;  offset /= 2) {
         // upper half of warps write to shared
         if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2*offset) {
@@ -779,15 +778,14 @@ void cuApplyRMSNormOptimized_(
 
     const T* lvals = vals + i1*n2;
     V* ovals = output_vals + i1*n2;
-    U c_invvar = rsqrt(sigma2 + epsilon);
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
-      ovals[i] = gamma[i] * static_cast<V>(c_invvar * curr);
+      ovals[i] = gamma[i] * static_cast<V>(curr / sqrt(sigma2 + epsilon));
 
     }
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-      invvar[i1] = c_invvar;
+      invvar[i1] = sqrt(sigma2 + epsilon);
     }
     __syncthreads();
   }
@@ -818,17 +816,16 @@ void cuApplyRMSNormOptimizedFused_(
     const T* lvals = vals + i1*n2;
     const T* lresidual = residual + i1*n2;
     V* ovals = output_vals + i1*n2;
-    U c_invvar = rsqrt(sigma2 + epsilon);
     const int numx = blockDim.x * blockDim.y;
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
       U curr_res = static_cast<U>(lresidual[i]);
-      ovals[i] = gamma[i] * static_cast<V>(c_invvar * (curr + curr_res));
+      ovals[i] = gamma[i] * static_cast<V>((curr + curr_res) / sqrt(sigma2 + epsilon));
 
     }
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-      invvar[i1] = c_invvar;
+      invvar[i1] =  sqrt(sigma2 + epsilon);
     }
     __syncthreads();
   }
@@ -1897,19 +1894,27 @@ void HostApplyRMSNormOptimized(
     const int warp_size = at::cuda::warp_size();
     const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
-    int block_dim = std::max(1, std::round(n2 / 2048.0));
-    block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
-    dim3 threads(warp_size, block_dim,1);
-    int nshared =
-        threads.y > 1 ?
-            threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
-            0; 
+    
     
     if (residual != NULL) {
+      int block_dim = std::max(1, std::round(n2 / 1024.0));
+      block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
+      dim3 threads(warp_size, block_dim, 1);
+      int nshared =
+          threads.y > 1 ?
+              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
+              0; 
       cuApplyRMSNormOptimizedFused<<<blocks, threads, nshared, stream>>>(
         output, invvar, input, residual, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }
     else {
+      int block_dim = std::max(1, std::round(n2 / 512.0));
+      block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
+      dim3 threads(warp_size, block_dim, 1);
+      int nshared =
+          threads.y > 1 ?
+              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
+              0; 
       cuApplyRMSNormOptimized<<<blocks, threads, nshared, stream>>>(
         output, invvar, input, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }
