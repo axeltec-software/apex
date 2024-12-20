@@ -778,14 +778,15 @@ void cuApplyRMSNormOptimized_(
 
     const T* lvals = vals + i1*n2;
     V* ovals = output_vals + i1*n2;
+    U c_invvar = rsqrt(sigma2 + epsilon);
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
-      ovals[i] = gamma[i] * static_cast<V>(curr / sqrt(sigma2 + epsilon));
+      ovals[i] = gamma[i] * static_cast<V>(curr * c_invvar);
 
     }
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-      invvar[i1] = sqrt(sigma2 + epsilon);
+      invvar[i1] = c_invvar;
     }
     __syncthreads();
   }
@@ -797,6 +798,7 @@ void cuApplyRMSNormOptimizedFused_(
   U* __restrict__ invvar,
   const T* __restrict__ vals,
   const T* __restrict__ residual,
+  T* __restrict__ inter_out, 
   const int n1,
   const int n2,
   const U epsilon,
@@ -821,7 +823,9 @@ void cuApplyRMSNormOptimizedFused_(
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
       U curr_res = static_cast<U>(lresidual[i]);
-      ovals[i] = gamma[i] * static_cast<V>((curr + curr_res) / sqrt(sigma2 + epsilon));
+      const U curr_sum = curr + curr_res;
+      ovals[i] = gamma[i] * static_cast<V>(curr_sum / sqrt(sigma2 + epsilon));
+      inter_out[i] = static_cast<T>(curr_sum);
 
     }
     if (threadIdx.x == 0 && threadIdx.y == 0) {
@@ -883,6 +887,7 @@ void cuApplyRMSNormOptimizedFused(
   U* __restrict__ invvar,
   const T* __restrict__ vals,
   const T* __restrict__ residual,
+  T* __restrict__ inter_out,
   const int n1,
   const int n2,
   const U epsilon,
@@ -890,7 +895,7 @@ void cuApplyRMSNormOptimizedFused(
   const int warp_size,
   const int block_dim)
 {
-  cuApplyRMSNormOptimizedFused_<T, U, V>(output_vals, invvar, vals, residual, n1, n2, epsilon, gamma, warp_size);
+  cuApplyRMSNormOptimizedFused_<T, U, V>(output_vals, invvar, vals, residual, inter_out, n1, n2, epsilon, gamma, warp_size);
 }
 
 
@@ -1003,8 +1008,7 @@ void cuLoadWriteStridedInputsOptimizedFused(
     const int row_stride,
     U* warp_buf1,
     U* warp_buf2,
-    const T* input_or_output,
-    const T* residual,
+    const T* inter_out,
     const V* dout,
     const int i1_end,
     const int n2,
@@ -1020,10 +1024,9 @@ void cuLoadWriteStridedInputsOptimizedFused(
       int load_idx = i1*n2+i2;
       int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
       if (i2<n2) {
-        U c_h = static_cast<U>(input_or_output[load_idx]);
-        U res_h = static_cast<U>(residual[load_idx]);
+        U c_h = static_cast<U>(inter_out[load_idx]);
         U curr_dout = static_cast<U>(dout[load_idx]);
-        warp_buf2[write_idx] = curr_dout * (c_h + res_h) * invvar[i1];
+        warp_buf2[write_idx] = curr_dout * c_h * invvar[i1];
       } else {
         warp_buf2[write_idx] = U(0);
       }
@@ -1123,8 +1126,7 @@ void cuLoadAddStridedInputsOptimizedFused(
     const int row_stride,
     U* warp_buf1,
     U* warp_buf2,
-    const T* input_or_output,
-    const T* residual,
+    const T* inter_out,
     const V* dout,
     const int i1_end,
     const int n2,
@@ -1140,10 +1142,9 @@ void cuLoadAddStridedInputsOptimizedFused(
       int load_idx = i1*n2+i2;
       int write_idx = thr_load_row_off*row_stride+thr_load_col_off+k;
       if (i2<n2) {
-        U c_h = static_cast<U>(input_or_output[load_idx]);
-        U res_h = static_cast<U>(residual[load_idx]);
+        U c_h = static_cast<U>(inter_out[load_idx]);
         U curr_dout = static_cast<U>(dout[load_idx]);
-        warp_buf2[write_idx] += curr_dout * (c_h + res_h) * invvar[i1];
+        warp_buf2[write_idx] += curr_dout * c_h * invvar[i1];
       }
     }
   }
@@ -1295,8 +1296,7 @@ void cuComputePartGradGammaBetaOptimized(
 template<typename T, typename U, typename V> __global__
 void cuComputePartGradGammaBetaOptimizedFused(
     const V* __restrict__ dout,
-    const T* __restrict__ input_or_output,
-    const T* __restrict__ residual,
+    const T* __restrict__ inter_out,
     const int n1,
     const int n2,
     const U* __restrict__ invvar,
@@ -1320,9 +1320,9 @@ void cuComputePartGradGammaBetaOptimizedFused(
     U* warp_buf2 = warp_buf1 + blockDim.y * blockDim.y * row_stride;
     // compute partial sums from strided inputs
     // do this to increase number of loads in flight
-    cuLoadWriteStridedInputsOptimizedFused<T, U, V>(i1_beg,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output, residual, dout,i1_end,n2, invvar,gamma, eps);
+    cuLoadWriteStridedInputsOptimizedFused<T, U, V>(i1_beg,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,inter_out, dout,i1_end,n2, invvar,gamma, eps);
     for (int i1_block = i1_beg+blockDim.y*blockDim.y;  i1_block < i1_end;  i1_block+=blockDim.y*blockDim.y) {
-      cuLoadAddStridedInputsOptimizedFused<T, U, V>(i1_block,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,input_or_output, residual, dout,i1_end,n2,invvar,gamma, eps);
+      cuLoadAddStridedInputsOptimizedFused<T, U, V>(i1_block,thr_load_row_off,thr_load_col_off,i2_off,row_stride,warp_buf1,warp_buf2,inter_out, dout,i1_end,n2,invvar,gamma, eps);
     }
     __syncthreads();
     // inter-warp reductions
@@ -1739,8 +1739,7 @@ void cuComputeGradInputOptimized(
 template<typename T, typename U, typename V> __global__
 void cuComputeGradInputOptimizedFused(
     const V* __restrict__ dout,
-    const T* __restrict__ input,
-    const T* __restrict__ residual,
+    const T* __restrict__ inter_out,
     const int n1,
     const int n2,
     const U* __restrict__ invvar,
@@ -1753,8 +1752,7 @@ void cuComputeGradInputOptimizedFused(
     U sum_loss1 = U(0);
     U sum_loss2 = U(0);
     const U c_invvar = invvar[i1];
-    const T* k_input = input + i1*n2;
-    const T* res_input = residual + i1*n2;
+    const T* k_inter_out = inter_out + i1*n2;
     const V* k_dout = dout + i1*n2;
     const int numx = blockDim.x * blockDim.y;
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
@@ -1763,7 +1761,7 @@ void cuComputeGradInputOptimizedFused(
     for( int l = 0; l < n2 ; l += numx) {
       int idx = l + thrx;
       const U gamma_idx = static_cast<U>((idx<n2) ? gamma[idx] : V(0));
-      const U c_h = static_cast<U>((idx<n2) ? k_input[idx] + res_input[idx] : T(0));
+      const U c_h = static_cast<U>((idx<n2) ? k_inter_out[idx] : T(0));
       const U c_loss = static_cast<U>((idx<n2) ? k_dout[idx] : V(0));
       sum_loss2 += c_loss * gamma_idx * (c_h) * c_invvar;
     }
@@ -1804,7 +1802,7 @@ void cuComputeGradInputOptimizedFused(
     T* k_grad_input = grad_input + i1*n2;
     T* k_grad_resdiaul = grad_residual + i1*n2;
     for (int l = thrx;  l < n2;  l+=numx) {
-      const U c_h = static_cast<U>(k_input[l] + res_input[l]);
+      const U c_h = static_cast<U>(k_inter_out[l]);
       const U c_loss = static_cast<U>(k_dout[l]);
       U f_grad_input = fH * c_loss * gamma[l];
       f_grad_input -= (c_h) * c_invvar * sum_loss2;
@@ -1885,6 +1883,7 @@ void HostApplyRMSNormOptimized(
     U* invvar,
     const T* input,
     const T* residual,
+    T* inter_out,
     int n1,
     int n2,
     double epsilon,
@@ -1895,26 +1894,24 @@ void HostApplyRMSNormOptimized(
     const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
     
-    
-    if (residual != NULL) {
-      int block_dim = std::max(1, std::round(n2 / 1024.0));
+    int block_dim = 2;
+
+    if ((n1 != n2) && (n1 < n2)) {
+      block_dim = std::max(1, std::round(n2 / 1024.0));
       block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
-      dim3 threads(warp_size, block_dim, 1);
-      int nshared =
-          threads.y > 1 ?
-              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
-              0; 
+      block_dim = std::min(block_dim, 4);
+    }
+    dim3 threads(warp_size, block_dim, 1);
+    int nshared =
+        threads.y > 1 ?
+            threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
+            0; 
+    if (residual != NULL) {
       cuApplyRMSNormOptimizedFused<<<blocks, threads, nshared, stream>>>(
-        output, invvar, input, residual, n1, n2, U(epsilon), gamma, warp_size, block_dim);
+        output, invvar, input, residual, inter_out, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }
     else {
-      int block_dim = std::max(1, std::round(n2 / 512.0));
-      block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
-      dim3 threads(warp_size, block_dim, 1);
-      int nshared =
-          threads.y > 1 ?
-              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
-              0; 
+      
       cuApplyRMSNormOptimized<<<blocks, threads, nshared, stream>>>(
         output, invvar, input, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }
@@ -1986,6 +1983,7 @@ void cuda_rms_norm_optimized(
     at::Tensor* invvar,
     at::Tensor* input,
     at::Tensor* residual,
+    at::Tensor* inter_out,
     int n1,
     int n2,
     #ifdef VERSION_GE_1_1
@@ -2005,6 +2003,7 @@ void cuda_rms_norm_optimized(
           invvar->DATA_PTR<accscalar_t>(),
           input->DATA_PTR<scalar_t_in>(),
           residual != NULL ? residual->DATA_PTR<scalar_t_in>() : NULL,
+          residual != NULL ? inter_out->DATA_PTR<scalar_t_in>() : NULL,
           n1,n2,
           epsilon,
           gamma != NULL ? gamma->DATA_PTR<scalar_t_out>() : NULL);
@@ -2201,32 +2200,18 @@ void HostRMSNormGradientOptimized(
         at::ScalarType::Float :
         input_or_output->scalar_type();
       at::Tensor part_grad_gamma = at::empty({part_size,n2}, input_or_output->options().dtype(part_grad_dtype));
-      if (residual != NULL) {
-        auto kernel = &cuComputePartGradGammaBetaOptimizedFused<T, U, V>;
-        kernel<<<blocks2, threads2, nshared2, stream>>>(
-                        dout,
-                        input_or_output->DATA_PTR<T>(),
-                        residual->DATA_PTR<T>(),
-                        n1,n2,
-                        invvar,
-                        U(epsilon),
-                        gamma,
-                        part_grad_gamma.DATA_PTR<U>(),
-                        epsilon);
-      }
-      else {
-        auto kernel = &cuComputePartGradGammaBetaOptimized<T, U, V>;
-        kernel<<<blocks2, threads2, nshared2, stream>>>(
-                        dout,
-                        input_or_output->DATA_PTR<T>(),
-                        n1,n2,
-                        invvar,
-                        U(epsilon),
-                        gamma,
-                        part_grad_gamma.DATA_PTR<U>(),
-                        epsilon,
-                        BLOCK_DIM);
-      }
+     
+      auto kernel = &cuComputePartGradGammaBetaOptimized<T, U, V>;
+      kernel<<<blocks2, threads2, nshared2, stream>>>(
+                      dout,
+                      input_or_output->DATA_PTR<T>(),
+                      n1,n2,
+                      invvar,
+                      U(epsilon),
+                      gamma,
+                      part_grad_gamma.DATA_PTR<U>(),
+                      epsilon,
+                      BLOCK_DIM);
 
       const int BLOCK_DIM_GAMMA = 8;
       const dim3 threads3(warp_size, BLOCK_DIM_GAMMA, 1);
@@ -2242,38 +2227,99 @@ void HostRMSNormGradientOptimized(
     // compute grad_input
     const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
-    const int  BLOCK_DIM_INPUT = std::round(n2 / 512.0);
+    const int  BLOCK_DIM_INPUT = std::min(std::round(n2 / 512.0), 4);
     const dim3 threads1(warp_size,BLOCK_DIM_INPUT,1);
     int nshared =
             threads1.y > 1 ?
             threads1.y*threads1.x*sizeof(U) :
             0;
-    if (residual != NULL) {
-      auto kernel = cuComputeGradInputOptimizedFused<T, U, V>;
-      kernel<<<blocks1, threads1, nshared, stream>>>(
-              dout,
-              input_or_output->DATA_PTR<T>(),
-              residual->DATA_PTR<T>(),
-              n1,n2,
-              invvar,
-              U(epsilon),
-              gamma,
-              grad_input,
-              grad_residual);
+    
+    auto kernel = cuComputeGradInputOptimized<T, U, V>;
+    kernel<<<blocks1, threads1, nshared, stream>>>(
+            dout,
+            input_or_output->DATA_PTR<T>(),
+            n1,n2,
+            invvar,
+            U(epsilon),
+            gamma,
+            grad_input,
+            BLOCK_DIM_INPUT,
+            warp_size);
+      
+}
+
+template<typename T, typename U=float, typename V=T>
+void HostRMSNormGradientOptimizedFused(
+    const V* dout,
+    const U* invvar,
+    at::Tensor* inter_out,
+    int n1,
+    int n2,
+    const V* gamma,
+    double epsilon,
+    T* grad_input,
+    T* grad_residual,
+    V* grad_gamma)
+{
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int warp_size = at::cuda::warp_size();
+    if (gamma != NULL) {
+      const int part_size = warp_size;
+      const int BLOCK_DIM = 4;
+      const dim3 threads2(warp_size,BLOCK_DIM,1);
+      const dim3 blocks2((n2+threads2.x-1)/threads2.x,part_size,1);
+      const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y * (threads2.x + 1);
+      const int nshared2_b = threads2.x * threads2.y * sizeof(U);
+      const int nshared2 = nshared2_a > nshared2_b ? nshared2_a : nshared2_b;
+      // note (mkozuki): I can hard code part_grad_gamma's dtype as float given that
+      // the `cuda_layer_norm_gradient` doesn't support double.
+      const auto part_grad_dtype =
+        (inter_out->scalar_type() == at::ScalarType::Half || inter_out->scalar_type() == at::ScalarType::BFloat16) ?
+        at::ScalarType::Float :
+        inter_out->scalar_type();
+      at::Tensor part_grad_gamma = at::empty({part_size,n2}, inter_out->options().dtype(part_grad_dtype));
+        auto kernel = &cuComputePartGradGammaBetaOptimizedFused<T, U, V>;
+        kernel<<<blocks2, threads2, nshared2, stream>>>(
+                        dout,
+                        inter_out->DATA_PTR<T>(),
+                        n1,n2,
+                        invvar,
+                        U(epsilon),
+                        gamma,
+                        part_grad_gamma.DATA_PTR<U>(),
+                        epsilon);
+
+      const int BLOCK_DIM_GAMMA = 8;
+      const dim3 threads3(warp_size, BLOCK_DIM_GAMMA, 1);
+      const dim3 blocks3((n2+threads2.x-1)/threads2.x,1,1);
+      const int nshared3 = threads3.x * threads3.y * sizeof(U);
+      cuComputeGradGammaBetaOptimized<<<blocks3, threads3, nshared3, stream>>>(
+                      part_grad_gamma.DATA_PTR<U>(),
+                      part_size,
+                      n1,n2,
+                      grad_gamma,BLOCK_DIM_GAMMA);
     }
-    else {
-      auto kernel = cuComputeGradInputOptimized<T, U, V>;
-      kernel<<<blocks1, threads1, nshared, stream>>>(
-              dout,
-              input_or_output->DATA_PTR<T>(),
-              n1,n2,
-              invvar,
-              U(epsilon),
-              gamma,
-              grad_input,
-              BLOCK_DIM_INPUT,
-              warp_size);
-    }
+
+    // compute grad_input
+    const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+    const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
+    const int  BLOCK_DIM_INPUT = std::min(std::round(n2 / 512.0), 4);
+    const dim3 threads1(warp_size,BLOCK_DIM_INPUT,1);
+    int nshared =
+            threads1.y > 1 ?
+            threads1.y*threads1.x*sizeof(U) :
+            0;
+    auto kernel = cuComputeGradInputOptimizedFused<T, U, V>;
+    kernel<<<blocks1, threads1, nshared, stream>>>(
+            dout,
+            inter_out->DATA_PTR<T>(),
+            n1,n2,
+            invvar,
+            U(epsilon),
+            gamma,
+            grad_input,
+            grad_residual);
+  
       
 }
 
@@ -2390,6 +2436,45 @@ void cuda_rms_norm_gradient_optimized(
         epsilon,
         grad_input->DATA_PTR<scalar_t_in>(),
         residual != NULL ? grad_residual->DATA_PTR<scalar_t_in>() : NULL,
+        gamma != NULL ? grad_gamma->DATA_PTR<scalar_t_out>() : NULL);
+    )
+}
+
+
+void cuda_rms_norm_gradient_optimized_fused(
+    at::Tensor* dout,
+    at::Tensor* invvar,
+    at::Tensor* inter_out,
+    int n1,
+    int n2,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor* gamma,
+    double epsilon,
+    at::Tensor* grad_input,
+    at::Tensor* grad_residual,
+    at::Tensor* grad_gamma)
+{
+    using namespace at;
+    // we can do away with `accscalar_t` as there're only three dtypes: fp32, fp16, bf16
+    // DISPATCH_FLOAT_HALF_AND_BFLOAT_INOUT_TYPES(
+    DISPATCH_DOUBLE_FLOAT_HALF_AND_BFLOAT_INOUT_TYPES(
+      inter_out->scalar_type(), gamma == NULL ? inter_out->scalar_type() :  gamma->scalar_type(), "cuComputeGradInputRMS",
+      using accscalar_t = at::acc_type<scalar_t_in, true>;
+      HostRMSNormGradientOptimizedFused(
+        dout->DATA_PTR<scalar_t_out>(),
+        invvar->DATA_PTR<accscalar_t>(),
+        inter_out,
+        n1,n2,
+            // TMJ pass NULL argument for gamma, beta, grad_gamma and grad_beta
+            // if gamma Tensor is NULL on input.
+        gamma != NULL ? gamma->DATA_PTR<scalar_t_out>() : NULL,
+        epsilon,
+        grad_input->DATA_PTR<scalar_t_in>(),
+        grad_residual->DATA_PTR<scalar_t_in>(),
         gamma != NULL ? grad_gamma->DATA_PTR<scalar_t_out>() : NULL);
     )
 }

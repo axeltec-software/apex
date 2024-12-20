@@ -303,6 +303,7 @@ void cuda_rms_norm_optimized(
     at::Tensor* invvar,
     at::Tensor* input,
     at::Tensor* residual,
+    at::Tensor* inter_out,
     int n1,
     int n2,
     #ifdef VERSION_GE_1_1
@@ -373,7 +374,7 @@ std::vector<at::Tensor> rms_norm_affine_optimized(
   at::Tensor output = at::empty_like(input);
   const auto stats_dtype = (input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16) ? at::ScalarType::Float : input.scalar_type();
   at::Tensor invvar = at::empty({n1}, input.options().dtype(stats_dtype));
-  cuda_rms_norm_optimized(&output,&invvar,&input, NULL, n1,n2,
+  cuda_rms_norm_optimized(&output,&invvar,&input, NULL, NULL, n1,n2,
       normalized_shape,&gamma,epsilon);
   
   return {output, invvar};
@@ -394,12 +395,13 @@ std::vector<at::Tensor> rms_norm_affine_optimized_fused(
   int n1,n2;
   check_args(input,normalized_shape,gamma,n1,n2);
   at::Tensor output = at::empty_like(input);
+  at::Tensor inter_out = at::empty_like(input);
   const auto stats_dtype = (input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16) ? at::ScalarType::Float : input.scalar_type();
   at::Tensor invvar = at::empty({n1}, input.options().dtype(stats_dtype));
-  cuda_rms_norm_optimized(&output,&invvar,&input, &residual, n1,n2,
+  cuda_rms_norm_optimized(&output,&invvar,&input, &residual, &inter_out, n1,n2,
       normalized_shape,&gamma,epsilon);
   
-  return {output, invvar};
+  return {output, invvar, inter_out};
 }
 
 std::vector<at::Tensor> rms_norm_affine_mixed_dtypes(
@@ -437,7 +439,7 @@ std::vector<at::Tensor> rms_norm_affine_mixed_dtypes_optimized(
   at::Tensor output = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
   at::Tensor invvar = at::empty({n1}, input.options().dtype(input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ? at::ScalarType::Float : input.scalar_type()));
 
-  cuda_rms_norm_optimized(&output,&invvar, &input,NULL, n1, n2,
+  cuda_rms_norm_optimized(&output,&invvar, &input,NULL,NULL, n1, n2,
       normalized_shape, &gamma,epsilon);
   return {output,invvar};
 }
@@ -456,11 +458,12 @@ std::vector<at::Tensor> rms_norm_affine_mixed_dtypes_optimized_fused(
   int n1, n2;
   check_args(input, normalized_shape, n1, n2);
   at::Tensor output = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
+  at::Tensor inter_out = at::empty_like(input, gamma.options().dtype(gamma.scalar_type()));
   at::Tensor invvar = at::empty({n1}, input.options().dtype(input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ? at::ScalarType::Float : input.scalar_type()));
 
-  cuda_rms_norm_optimized(&output,&invvar, &input, &residual, n1, n2,
+  cuda_rms_norm_optimized(&output,&invvar, &input, &residual, &inter_out, n1, n2,
       normalized_shape, &gamma,epsilon);
-  return {output,invvar};
+  return {output,invvar, inter_out};
 }
 
 void cuda_rms_norm_gradient(
@@ -485,6 +488,23 @@ void cuda_rms_norm_gradient_optimized(
     at::Tensor* invvar,
     at::Tensor* input_or_output,
     at::Tensor* residual,
+    int n1,
+    int n2,
+    #ifdef VERSION_GE_1_1
+    at::IntArrayRef normalized_shape,
+    #else
+    at::IntList normalized_shape,
+    #endif
+    at::Tensor* gamma,
+    double epsilon,
+    at::Tensor* grad_input,
+    at::Tensor* grad_residual,
+    at::Tensor* grad_gamma);
+
+void cuda_rms_norm_gradient_optimized_fused(
+    at::Tensor* dout,
+    at::Tensor* invvar,
+    at::Tensor* inter_out,
     int n1,
     int n2,
     #ifdef VERSION_GE_1_1
@@ -573,8 +593,7 @@ std::vector<at::Tensor> rms_norm_gradient_affine_optimized(
 std::vector<at::Tensor> rms_norm_gradient_affine_optimized_fused(
     at::Tensor dout,
     at::Tensor invvar,
-    at::Tensor input_or_output,
-    at::Tensor residual,
+    at::Tensor inter_out,
     #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
     #else
@@ -583,15 +602,14 @@ std::vector<at::Tensor> rms_norm_gradient_affine_optimized_fused(
     at::Tensor gamma,
     double epsilon) {
   CHECK_INPUT(dout);
-  CHECK_INPUT(invvar);
-  CHECK_INPUT(input_or_output);
+  CHECK_INPUT(inter_out);
   CHECK_INPUT(gamma);
   int n1,n2;
-  check_args(input_or_output,normalized_shape,gamma,n1,n2);
-  at::Tensor grad_input = at::empty_like(input_or_output);
-  at::Tensor grad_residual = at::empty_like(residual);
+  check_args(inter_out,normalized_shape,gamma,n1,n2);
+  at::Tensor grad_input = at::empty_like(inter_out);
+  at::Tensor grad_residual = at::empty_like(inter_out);
   at::Tensor grad_gamma = at::empty_like(gamma);
-  cuda_rms_norm_gradient_optimized(&dout,&invvar,&input_or_output, &residual, n1,n2,
+  cuda_rms_norm_gradient_optimized_fused(&dout,&invvar,&inter_out, n1,n2,
       normalized_shape,&gamma,epsilon,
       &grad_input, &grad_residual, &grad_gamma);
   return {grad_input, grad_residual, grad_gamma};
