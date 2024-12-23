@@ -817,19 +817,21 @@ void cuApplyRMSNormOptimizedFused_(
 
     const T* lvals = vals + i1*n2;
     const T* lresidual = residual + i1*n2;
+    T* lvals_inter = inter_out + i1*n2;
     V* ovals = output_vals + i1*n2;
     const int numx = blockDim.x * blockDim.y;
     const int thrx = threadIdx.x + threadIdx.y * blockDim.x;
+    U c_invvar = rsqrt(sigma2 + epsilon);
     for (int i = thrx;  i < n2;  i+=numx) {
       U curr = static_cast<U>(lvals[i]);
       U curr_res = static_cast<U>(lresidual[i]);
       const U curr_sum = curr + curr_res;
-      ovals[i] = gamma[i] * static_cast<V>(curr_sum / sqrt(sigma2 + epsilon));
-      inter_out[i] = static_cast<T>(curr_sum);
+      ovals[i] = gamma[i] * static_cast<V>(curr_sum * c_invvar);
+      lvals_inter[i] = static_cast<T>(curr_sum);
 
     }
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-      invvar[i1] =  sqrt(sigma2 + epsilon);
+      invvar[i1] =  c_invvar;
     }
     __syncthreads();
   }
@@ -1896,22 +1898,30 @@ void HostApplyRMSNormOptimized(
     
     int block_dim = 2;
 
-    if ((n1 != n2) && (n1 < n2)) {
+    
+    if (residual != NULL) {
       block_dim = std::max(1, std::round(n2 / 1024.0));
       block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
       block_dim = std::min(block_dim, 4);
-    }
-    dim3 threads(warp_size, block_dim, 1);
-    int nshared =
-        threads.y > 1 ?
-            threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
-            0; 
-    if (residual != NULL) {
+      dim3 threads(warp_size, block_dim, 1);
+      int nshared =
+          threads.y > 1 ?
+              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
+              0; 
       cuApplyRMSNormOptimizedFused<<<blocks, threads, nshared, stream>>>(
         output, invvar, input, residual, inter_out, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }
     else {
-      
+      if ((n1 != n2) && (n1 < n2)) {
+        block_dim = std::max(1, std::round(n2 / 1024.0));
+        block_dim = block_dim != 1 ? std::round(block_dim * 0.5) * 2 : block_dim;
+        block_dim = std::min(block_dim, 4);
+      }
+      dim3 threads(warp_size, block_dim, 1);
+      int nshared =
+          threads.y > 1 ?
+              threads.y*sizeof(U)+(threads.y/2)*sizeof(U) :
+              0; 
       cuApplyRMSNormOptimized<<<blocks, threads, nshared, stream>>>(
         output, invvar, input, n1, n2, U(epsilon), gamma, warp_size, block_dim);
     }

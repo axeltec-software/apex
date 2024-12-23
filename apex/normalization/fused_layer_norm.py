@@ -153,7 +153,7 @@ class FusedRMSNormAffineMixedDtypesFunction(FusedRMSNormAffineFunction):
             )
         else:
             if ctx.add_residual:
-                output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes_optimized_fused(
+                output, invvar, inter_out = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes_optimized_fused(
                     input_, residual_, ctx.normalized_shape, weight_, ctx.eps
                 )
             else:
@@ -161,7 +161,10 @@ class FusedRMSNormAffineMixedDtypesFunction(FusedRMSNormAffineFunction):
                     input_, ctx.normalized_shape, weight_, ctx.eps
                 )
 
-        ctx.save_for_backward(input_, residual, weight_, invvar)
+        if ctx.add_residual:
+            ctx.save_for_backward(inter_out, weight_, invvar)
+        else:
+            ctx.save_for_backward(input_, residual_, weight_, invvar)
         return output
 
 
